@@ -391,7 +391,10 @@ class DocumentDetailView(APIView):
         if document.owner_id != request.user.pk:
             raise PermissionDenied('You do not have permission to delete this document.')
         document.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        return Response(
+            status=status.HTTP_200_OK,
+            data={'message': f"Document with ID {pk} deleted successfully."},
+        )
 
 
 class QueryCreateView(APIView):

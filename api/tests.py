@@ -161,7 +161,11 @@ class DocumentAPITests(APITestCase):
         self.assertEqual(patch.data['content'], 'Patched content.')
 
         deletion = self.client.delete(f'/documents/{document_id}')
-        self.assertEqual(deletion.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(deletion.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            deletion.data['message'],
+            f'Document with ID {document_id} deleted successfully.',
+        )
         self.assertFalse(Document.objects.filter(pk=document_id).exists())
         self.assertEqual(
             self.client.get(f'/documents/{document_id}').status_code,
