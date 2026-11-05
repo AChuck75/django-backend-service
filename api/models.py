@@ -22,6 +22,29 @@ class Document(models.Model):
         return self.title
 
 
+class DocumentChunk(models.Model):
+    document = models.ForeignKey(
+        Document,
+        on_delete=models.CASCADE,
+        related_name='chunks',
+    )
+    chunk_index = models.PositiveIntegerField()
+    chunk_text = models.TextField()
+    embedding = models.JSONField()
+
+    class Meta:
+        ordering = ('document_id', 'chunk_index')
+        constraints = [
+            models.UniqueConstraint(
+                fields=('document', 'chunk_index'),
+                name='api_doc_chunk_index_uniq',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=('document', 'chunk_index'), name='api_chunk_doc_idx'),
+        ]
+
+
 class QueryLog(models.Model):
     query_text = models.TextField()
     result_summary = models.TextField()

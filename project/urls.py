@@ -2,11 +2,14 @@ from django.contrib import admin
 from django.urls import path, re_path
 
 from api.views import (
+    AskAIView,
     DocumentCollectionView,
     DocumentDetailView,
+    IngestDocumentView,
     LoginView,
     QueryCreateView,
     QueryListView,
+    RAGQueryView,
     RegistrationView,
 )
 
@@ -22,4 +25,8 @@ urlpatterns = [
     ),
     re_path(r'^query/?$', QueryCreateView.as_view(), name='query-create'),
     re_path(r'^queries/?$', QueryListView.as_view(), name='query-list'),
+    path('api/ask-ai', AskAIView.as_view(), name='ask-ai'),
+    path('api/rag-query', RAGQueryView.as_view(), name='rag-query'),
+    path('api/ingest-doc', IngestDocumentView.as_view(), name='ingest-document'),
+    path('api/query-history', QueryListView.as_view(), name='query-history'),
 ]

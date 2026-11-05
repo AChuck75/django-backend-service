@@ -1,12 +1,16 @@
+import json
 from datetime import timedelta
+from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
-from .models import Document, QueryLog, UserSession
+from .ai import cosine_similarity, create_embeddings, generate_answer
+from .models import Document, DocumentChunk, QueryLog, UserSession
 from .views import QUERY_RESULT_SUMMARY, hash_token, issue_user_session
 
 User = get_user_model()
@@ -305,4 +309,183 @@ class QueryAPITests(APITestCase):
         self.assertEqual(
             other_response.data['results'][0]['query_text'],
             'other private query',
+        )
+
+
+class AIAssignmentEndpointTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='ai-owner',
+            password='FrostedPine!4729',
+        )
+        self.other_user = User.objects.create_user(
+            username='ai-other',
+            password='GraniteCedar!5831',
+        )
+        token, _ = issue_user_session(self.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token}')
+
+    def _other_client(self):
+        token, _ = issue_user_session(self.other_user)
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f'Token {token}')
+        return client
+
+    @patch('api.views.generate_answer', return_value='A generated response.')
+    def test_ask_ai_uses_template_and_saves_owner_history(self, generate_answer):
+        response = self.client.post(
+            '/api/ask-ai',
+            {'prompt': 'Summarize this plan.'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {'answer': 'A generated response.'})
+        system_prompt, user_prompt = generate_answer.call_args.args
+        self.assertIn('helpful assistant', system_prompt)
+        self.assertIn('Please respond to this user request:', user_prompt)
+        self.assertIn('Summarize this plan.', user_prompt)
+        history = self.client.get('/api/query-history?page=1&page_size=5')
+        self.assertEqual(history.status_code, status.HTTP_200_OK)
+        self.assertEqual(history.data['count'], 1)
+        self.assertEqual(history.data['results'][0]['query_text'], 'Summarize this plan.')
+
+    @patch('api.views.create_embeddings')
+    def test_ingestion_chunks_and_replaces_document_vectors(self, create_embeddings):
+        document = Document.objects.create(
+            owner=self.user,
+            title='Long document',
+            content=' '.join(f'word{index}' for index in range(501)),
+        )
+        create_embeddings.side_effect = lambda texts: [[1.0, 0.0] for _ in texts]
+
+        response = self.client.post(
+            '/api/ingest-doc',
+            {'document_id': document.id},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {'status': 'success', 'chunk_count': 2})
+        chunks = list(DocumentChunk.objects.filter(document=document))
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(len(chunks[0].chunk_text.split()), 500)
+        self.assertEqual(len(chunks[1].chunk_text.split()), 51)
+        self.assertEqual(chunks[0].chunk_text.split()[-50:], chunks[1].chunk_text.split()[:50])
+
+        self.client.post(
+            '/api/ingest-doc',
+            {'document_id': document.id},
+            format='json',
+        )
+        self.assertEqual(DocumentChunk.objects.filter(document=document).count(), 2)
+        self.assertEqual(
+            self._other_client().post(
+                '/api/ingest-doc',
+                {'document_id': document.id},
+                format='json',
+            ).status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    @patch('api.views.generate_answer', return_value='The document says launch in June.')
+    @patch('api.views.create_embeddings', return_value=[[1.0, 0.0]])
+    def test_rag_returns_relevant_owner_scoped_source_chunks(
+        self,
+        create_embeddings,
+        generate_answer,
+    ):
+        owned_document = Document.objects.create(
+            owner=self.user,
+            title='Owned',
+            content='Owned content.',
+        )
+        other_document = Document.objects.create(
+            owner=self.other_user,
+            title='Other',
+            content='Private other-user content.',
+        )
+        DocumentChunk.objects.create(
+            document=owned_document,
+            chunk_index=0,
+            chunk_text='The launch is planned for June.',
+            embedding=[0.9, 0.1],
+        )
+        DocumentChunk.objects.create(
+            document=owned_document,
+            chunk_index=1,
+            chunk_text='The budget is confidential.',
+            embedding=[0.0, 1.0],
+        )
+        DocumentChunk.objects.create(
+            document=other_document,
+            chunk_index=0,
+            chunk_text='Other user private information.',
+            embedding=[1.0, 0.0],
+        )
+
+        response = self.client.post(
+            '/api/rag-query',
+            {'query': 'When is launch?'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['answer'], 'The document says launch in June.')
+        self.assertEqual(
+            response.data['sources'],
+            [
+                {
+                    'document_id': owned_document.id,
+                    'chunk_text': 'The launch is planned for June.',
+                },
+                {
+                    'document_id': owned_document.id,
+                    'chunk_text': 'The budget is confidential.',
+                },
+            ],
+        )
+        system_prompt, user_prompt = generate_answer.call_args.args
+        self.assertIn('only the supplied document context', system_prompt)
+        self.assertIn('The launch is planned for June.', user_prompt)
+        self.assertNotIn('Other user private information.', user_prompt)
+        self.assertEqual(
+            self._other_client().get('/api/query-history').data['count'],
+            0,
+        )
+
+
+class ClaudeIntegrationTests(APITestCase):
+    @override_settings(ANTHROPIC_API_KEY='test-claude-key')
+    @patch('api.ai.urlopen')
+    def test_answer_uses_claude_messages_api(self, urlopen):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps(
+            {'content': [{'type': 'text', 'text': 'Claude response.'}]}
+        ).encode('utf-8')
+        urlopen.return_value = response
+
+        answer = generate_answer('System instructions.', 'User question.')
+
+        self.assertEqual(answer, 'Claude response.')
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, 'https://api.anthropic.com/v1/messages')
+        self.assertEqual(request.get_header('X-api-key'), 'test-claude-key')
+        self.assertEqual(request.get_header('Anthropic-version'), '2023-06-01')
+        payload = json.loads(request.data.decode('utf-8'))
+        self.assertEqual(payload['system'], 'System instructions.')
+        self.assertEqual(
+            payload['messages'],
+            [{'role': 'user', 'content': 'User question.'}],
+        )
+
+    def test_local_embeddings_are_deterministic_and_rank_shared_terms(self):
+        first, similar, unrelated = create_embeddings(
+            ['launch date is in June', 'what is the launch date', 'recipe for apple pie']
+        )
+
+        self.assertEqual(first, create_embeddings(['launch date is in June'])[0])
+        self.assertGreater(
+            cosine_similarity(first, similar),
+            cosine_similarity(first, unrelated),
         )

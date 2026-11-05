@@ -40,6 +40,11 @@ The application has deliberately local-only defaults:
 - `DJANGO_ALLOWED_HOSTS`: comma-separated allowed host names. Defaults include `localhost`, `127.0.0.1`, `[::1]`, and `testserver`.
 - `DJANGO_DB_NAME`: optional path to the local SQLite database file.
 - `TOKEN_SESSION_LIFETIME_SECONDS`: positive session lifetime in seconds. It defaults to `86400` (24 hours).
+- `ANTHROPIC_API_KEY`: Claude API key. AI answer requests return `503` until this is configured.
+- `ANTHROPIC_BASE_URL`: Anthropic API base URL; defaults to `https://api.anthropic.com`.
+- `CLAUDE_MODEL`: Claude model name; defaults to `claude-sonnet-4-5-20250929`.
+- `AI_PROVIDER_TIMEOUT_SECONDS`: positive provider timeout; defaults to `30`.
+- `AI_MAX_RESPONSE_TOKENS`: positive maximum response size; defaults to `1024`.
 
 For example:
 
@@ -48,6 +53,7 @@ export DJANGO_SECRET_KEY=replace-with-a-secret-from-a-secret-manager
 export DJANGO_DEBUG=0
 export DJANGO_ALLOWED_HOSTS=api.example.com
 export TOKEN_SESSION_LIFETIME_SECONDS=86400
+export ANTHROPIC_API_KEY=replace-with-your-claude-api-key
 ```
 
 ## Authentication
@@ -86,6 +92,34 @@ Paths shown without a trailing slash also accept one trailing slash.
 | DELETE | `/documents/{id}` | Yes | Delete an owned document. Existing documents owned by another user return `403`. |
 | POST | `/query` | Yes | Save one query-history entry. |
 | GET | `/queries` | Yes | List only the caller's query history. |
+| POST | `/api/ask-ai` | Yes | Generate an answer to a prompt using a fixed system prompt and save it to query history. |
+| POST | `/api/rag-query` | Yes | Answer a query using retrieved, ingested document chunks and return those source chunks. |
+| POST | `/api/ingest-doc` | Yes | Chunk an owned document, create embeddings, and store them for retrieval. |
+| GET | `/api/query-history` | Yes | Paginated AI query history belonging to the caller. |
+
+### AI document ingestion and retrieval
+
+Answer generation uses the Anthropic Messages API with `ANTHROPIC_API_KEY` and `CLAUDE_MODEL`. No second API key is needed: chunk and query vectors are generated locally using deterministic signed feature hashing over words and adjacent word pairs (512 dimensions), then stored in SQLite. This is a lightweight lexical vectorizer, not a neural semantic embedding model, so retrieval may not match the quality of a dedicated embedding model. Prompt requests are wrapped in fixed system/user templates; RAG answers are instructed to use the retrieved context and to say when it is insufficient.
+
+Ingest an owned document by ID:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/ingest-doc -H 'Authorization: Token <raw-token>' -H 'Content-Type: application/json' -d '{"document_id":7}'
+```
+
+Documents are split on whitespace into chunks of at most **500 words**, with a **50-word overlap** between adjacent chunks. Locally generated feature-hash vectors and chunk text are persisted in the SQLite `DocumentChunk` table. Retrieval computes cosine similarity against the requester's stored vectors and returns up to five chunks; documents owned by other users are never searched. Re-ingestion replaces the existing chunks for that document. If the document has no text, ingestion succeeds with a chunk count of zero.
+
+Ask a standalone prompt or a retrieval-augmented question:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/ask-ai -H 'Authorization: Token <raw-token>' -H 'Content-Type: application/json' -d '{"prompt":"Explain the key points of a project plan."}'
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/rag-query -H 'Authorization: Token <raw-token>' -H 'Content-Type: application/json' -d '{"query":"What are the project milestones?"}'
+```
+
+The RAG response contains `answer` and `sources`; every source has `document_id` and `chunk_text`. Both AI endpoints save successful requests and answers to the same owner-isolated history returned by `GET /api/query-history?page=1&page_size=10`. The SQLite vector store is intended for this local-development backend; use a dedicated vector database for larger deployments.
 
 ### JSON document creation
 

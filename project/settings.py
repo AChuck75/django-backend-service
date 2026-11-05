@@ -1,8 +1,10 @@
 import os
 from pathlib import Path
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+load_dotenv(BASE_DIR / 'project' / '.env')
 
 def _env_bool(name, default=False):
     value = os.environ.get(name)
@@ -111,3 +113,13 @@ TOKEN_SESSION_LIFETIME_SECONDS = _positive_int_env(
 DOCUMENT_UPLOAD_MAX_BYTES = 5 * 1024 * 1024
 DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024
 FILE_UPLOAD_MAX_MEMORY_SIZE = 2_621_440
+
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+ANTHROPIC_BASE_URL = os.environ.get(
+    'ANTHROPIC_BASE_URL',
+    'https://api.anthropic.com',
+)
+CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-5-20250929')
+AI_PROVIDER_TIMEOUT_SECONDS = _positive_int_env('AI_PROVIDER_TIMEOUT_SECONDS', 30)
+AI_MAX_RESPONSE_TOKENS = _positive_int_env('AI_MAX_RESPONSE_TOKENS', 1024)
+LOCAL_EMBEDDING_DIMENSIONS = 512
