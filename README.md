@@ -1,12 +1,13 @@
 # Document API Backend
 
-A local-development Django REST Framework backend for user-owned text documents and persistent query history. It uses SQLite by default, Django's password hashing, and an expiring custom token scheme.
+A local-development GenAI assistant with a Streamlit UI, authenticated Django REST Framework API, Claude answers, a branching LangGraph agent, SQLite-backed document chunks, and live weather lookup through Open-Meteo.
 
 ## Requirements
 
 - Python 3.11 or newer
 - Django 5.x
 - Django REST Framework
+- Streamlit, LangChain Core, LangGraph, and pypdf (installed from `requirements.txt`)
 
 ## Local setup
 
@@ -17,6 +18,14 @@ python -m pip install -r requirements.txt
 python manage.py migrate
 python manage.py runserver
 ```
+
+In a second terminal with the same virtual environment activated, run the UI:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+The UI connects to `http://127.0.0.1:8000` by default. Set `DJANGO_API_BASE_URL` if the Django API is hosted elsewhere.
 
 Run the automated test suite with:
 
@@ -96,10 +105,15 @@ Paths shown without a trailing slash also accept one trailing slash.
 | POST | `/api/rag-query` | Yes | Answer a query using retrieved, ingested document chunks and return those source chunks. |
 | POST | `/api/ingest-doc` | Yes | Chunk an owned document, create embeddings, and store them for retrieval. |
 | GET | `/api/query-history` | Yes | Paginated AI query history belonging to the caller. |
+| POST | `/api/assistant-chat` | Yes | Run the branching LangGraph assistant with chat history, document retrieval, and weather tool routing. |
 
 ### AI document ingestion and retrieval
 
-Answer generation uses the Anthropic Messages API with `ANTHROPIC_API_KEY` and `CLAUDE_MODEL`. No second API key is needed: chunk and query vectors are generated locally using deterministic signed feature hashing over words and adjacent word pairs (512 dimensions), then stored in SQLite. This is a lightweight lexical vectorizer, not a neural semantic embedding model, so retrieval may not match the quality of a dedicated embedding model. Prompt requests are wrapped in fixed system/user templates; RAG answers are instructed to use the retrieved context and to say when it is insufficient.
+Answer generation uses the Anthropic Messages API with `ANTHROPIC_API_KEY` and `CLAUDE_MODEL`. No second API key is needed: chunk and query vectors are generated locally using deterministic signed feature hashing over words and adjacent word pairs (512 dimensions), then stored in SQLite. This is a lightweight lexical vectorizer, not a neural semantic embedding model, so retrieval may not match the quality of a dedicated embedding model. Retrieval searches all indexed chunks owned by the requester, including chunks from multiple documents.
+
+The Streamlit chat stores visible turns in `st.session_state` and sends the previous turns with each request, providing session-scoped conversational context (it resets when the Streamlit session is cleared). The LangGraph agent first routes weather/forecast requests to the Open-Meteo tool and other requests to document retrieval; both branches then pass tool results and available history to Claude to generate the response. The weather tool geocodes the requested location and fetches current conditions or a next-day forecast when asked. Open-Meteo is a public service and does not require an additional API key.
+
+Use the Streamlit sidebar to upload PDF or TXT documents. PDF text is extracted with pypdf; encrypted, malformed, or image-only PDFs without extractable text are rejected. The UI creates the document, calls ingestion, and displays the chunk count. Retrieved source chunks and document IDs are displayed directly below document-grounded answers in the chat.
 
 Ingest an owned document by ID:
 
@@ -135,10 +149,11 @@ The authenticated user is always the document owner. Client-supplied owner, iden
 curl -X POST http://127.0.0.1:8000/documents -H 'Authorization: Token <raw-token>' -F 'file=@notes.md;type=text/markdown'
 ```
 
-Only UTF-8 `.txt` and `.md` files are accepted. The file must be at most 5 MiB. The server checks the extension, checks a declared text MIME type, strictly decodes UTF-8, and rejects embedded NUL bytes. Accepted MIME types are:
+Only UTF-8 `.txt` and `.md` text files and extractable-text `.pdf` files are accepted. The file must be at most 5 MiB. The server checks the extension and declared MIME type, strictly decodes text files as UTF-8, and rejects embedded NUL bytes in text files. Accepted MIME types are:
 
 - `.txt`: `text/plain`
 - `.md`: `text/plain`, `text/markdown`, `text/x-markdown`, or `application/markdown`
+- `.pdf`: `application/pdf`
 
 The filename stem becomes the document title. Original uploaded file bytes are not stored; only decoded content is saved in `Document.content`.
 

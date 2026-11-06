@@ -3,6 +3,7 @@ from django.urls import path, re_path
 
 from api.views import (
     AskAIView,
+    AssistantChatView,
     DocumentCollectionView,
     DocumentDetailView,
     IngestDocumentView,
@@ -29,4 +30,5 @@ urlpatterns = [
     path('api/rag-query', RAGQueryView.as_view(), name='rag-query'),
     path('api/ingest-doc', IngestDocumentView.as_view(), name='ingest-document'),
     path('api/query-history', QueryListView.as_view(), name='query-history'),
+    path('api/assistant-chat', AssistantChatView.as_view(), name='assistant-chat'),
 ]

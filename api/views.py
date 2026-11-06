@@ -20,7 +20,13 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from .agent import run_assistant
 from .ai import cosine_similarity, create_embeddings, generate_answer
+from .document_processing import (
+    InvalidPDFError,
+    NoExtractablePDFTextError,
+    extract_pdf_text,
+)
 from .models import Document, DocumentChunk, QueryLog, UserSession
 
 
@@ -181,6 +187,20 @@ class IngestDocumentSerializer(serializers.Serializer):
     document_id = serializers.IntegerField(min_value=1)
 
 
+class ChatHistoryMessageSerializer(serializers.Serializer):
+    role = serializers.ChoiceField(choices=('user', 'assistant'))
+    content = serializers.CharField(max_length=10000)
+
+
+class AssistantChatSerializer(serializers.Serializer):
+    prompt = serializers.CharField(max_length=10000)
+    history = serializers.ListField(
+        child=ChatHistoryMessageSerializer(),
+        required=False,
+        max_length=20,
+    )
+
+
 class StandardPagination(PageNumberPagination):
     page_size = 10
     page_size_query_param = 'page_size'
@@ -247,6 +267,7 @@ RAG_SYSTEM_PROMPT = (
 )
 ALLOWED_UPLOAD_MIME_TYPES = {
     '.txt': {'text/plain'},
+    '.pdf': {'application/pdf'},
     '.md': {
         'text/plain',
         'text/markdown',
@@ -268,7 +289,7 @@ def _document_data_from_upload(uploaded_file):
     accepted_mime_types = ALLOWED_UPLOAD_MIME_TYPES.get(suffix)
     if accepted_mime_types is None:
         raise serializers.ValidationError(
-            {'file': ['Unsupported file extension. Only .txt and .md files are accepted.']}
+            {'file': ['Unsupported file extension. Accepted types are .pdf, .txt, and .md.']}
         )
 
     declared_mime_type = (uploaded_file.content_type or '').split(';', 1)[0].strip().lower()
@@ -286,12 +307,18 @@ def _document_data_from_upload(uploaded_file):
     raw_content = uploaded_file.read()
     if len(raw_content) > settings.DOCUMENT_UPLOAD_MAX_BYTES:
         raise UploadTooLarge()
-    try:
-        content = raw_content.decode('utf-8')
-    except (AttributeError, UnicodeDecodeError):
-        raise serializers.ValidationError({'file': ['File must be valid UTF-8 text.']})
-    if '\x00' in content:
-        raise serializers.ValidationError({'file': ['File must not contain NUL bytes.']})
+    if suffix == '.pdf':
+        try:
+            content = extract_pdf_text(raw_content)
+        except (InvalidPDFError, NoExtractablePDFTextError) as error:
+            raise serializers.ValidationError({'file': [str(error)]}) from error
+    else:
+        try:
+            content = raw_content.decode('utf-8')
+        except (AttributeError, UnicodeDecodeError):
+            raise serializers.ValidationError({'file': ['File must be valid UTF-8 text.']})
+        if '\x00' in content:
+            raise serializers.ValidationError({'file': ['File must not contain NUL bytes.']})
 
     title = Path(filename).stem.strip() or 'Untitled document'
     return {'title': title, 'content': content}
@@ -472,6 +499,35 @@ class AskAIView(APIView):
             result_summary=answer,
         )
         return Response({'answer': answer}, status=status.HTTP_200_OK)
+
+
+class AssistantChatView(APIView):
+    authentication_classes = [ExpiringTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+    parser_classes = [JSONParser]
+
+    def post(self, request):
+        serializer = AssistantChatSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        prompt = serializer.validated_data['prompt']
+        result = run_assistant(
+            user_id=request.user.pk,
+            prompt=prompt,
+            history=serializer.validated_data.get('history', []),
+        )
+        QueryLog.objects.create(
+            user=request.user,
+            query_text=prompt,
+            result_summary=result['answer'],
+        )
+        return Response(
+            {
+                'answer': result['answer'],
+                'sources': result['sources'],
+                'route': result['route'],
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 def _chunk_document(content):

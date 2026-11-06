@@ -12,8 +12,45 @@ from rest_framework.test import APIClient, APITestCase
 from .ai import cosine_similarity, create_embeddings, generate_answer
 from .models import Document, DocumentChunk, QueryLog, UserSession
 from .views import QUERY_RESULT_SUMMARY, hash_token, issue_user_session
+from .weather import fetch_current_weather
 
 User = get_user_model()
+
+
+def _minimal_text_pdf(text):
+    escaped_text = text.replace('\\', '\\\\').replace('(', '\\(').replace(')', '\\)')
+    stream = f'BT /F1 12 Tf 72 720 Td ({escaped_text}) Tj ET'.encode('ascii')
+    objects = [
+        b'<< /Type /Catalog /Pages 2 0 R >>',
+        b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+        (
+            b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] '
+            b'/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>'
+        ),
+        (
+            b'<< /Length ' + str(len(stream)).encode('ascii') + b' >>\n'
+            b'stream\n' + stream + b'\nendstream'
+        ),
+        b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    ]
+    pdf = bytearray(b'%PDF-1.4\n')
+    offsets = [0]
+    for index, body in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf.extend(f'{index} 0 obj\n'.encode('ascii'))
+        pdf.extend(body)
+        pdf.extend(b'\nendobj\n')
+    xref_offset = len(pdf)
+    pdf.extend(b'xref\n0 6\n0000000000 65535 f \n')
+    for offset in offsets[1:]:
+        pdf.extend(f'{offset:010d} 00000 n \n'.encode('ascii'))
+    pdf.extend(
+        (
+            f'trailer\n<< /Size 6 /Root 1 0 R >>\n'
+            f'startxref\n{xref_offset}\n%%EOF\n'
+        ).encode('ascii')
+    )
+    return bytes(pdf)
 
 
 class AuthenticationEndpointTests(APITestCase):
@@ -209,6 +246,25 @@ class DocumentAPITests(APITestCase):
             oversized.status_code,
             status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
         )
+
+    def test_pdf_upload_extracts_text_for_document_ingestion(self):
+        upload = SimpleUploadedFile(
+            'project_plan.pdf',
+            _minimal_text_pdf('The launch milestone is scheduled for June.'),
+            content_type='application/pdf',
+        )
+        response = self.client.post('/documents', {'file': upload}, format='multipart')
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['title'], 'project_plan')
+        self.assertIn('launch milestone', response.data['content'])
+        ingestion = self.client.post(
+            '/api/ingest-doc',
+            {'document_id': response.data['id']},
+            format='json',
+        )
+        self.assertEqual(ingestion.status_code, status.HTTP_200_OK)
+        self.assertEqual(ingestion.data['chunk_count'], 1)
 
     def test_document_ownership_privacy_and_delete_permission(self):
         document = Document.objects.create(
@@ -448,10 +504,141 @@ class AIAssignmentEndpointTests(APITestCase):
         self.assertIn('only the supplied document context', system_prompt)
         self.assertIn('The launch is planned for June.', user_prompt)
         self.assertNotIn('Other user private information.', user_prompt)
+        create_embeddings.assert_called_once_with(['When is launch?'])
         self.assertEqual(
             self._other_client().get('/api/query-history').data['count'],
             0,
         )
+
+    @patch('api.agent.generate_answer', return_value='Both documents describe launch timing.')
+    def test_assistant_retrieves_chunks_from_multiple_ingested_documents(
+        self,
+        generate_answer,
+    ):
+        documents = [
+            Document.objects.create(
+                owner=self.user,
+                title='Mission Alpha',
+                content='The spacecraft launch schedule is planned for June.',
+            ),
+            Document.objects.create(
+                owner=self.user,
+                title='Mission Beta',
+                content='The second mission launch schedule is planned for July.',
+            ),
+        ]
+        for document in documents:
+            response = self.client.post(
+                '/api/ingest-doc',
+                {'document_id': document.id},
+                format='json',
+            )
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        response = self.client.post(
+            '/api/assistant-chat',
+            {'prompt': 'What is the launch schedule?'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['answer'], 'Both documents describe launch timing.')
+        self.assertEqual(
+            {source['document_id'] for source in response.data['sources']},
+            {document.id for document in documents},
+        )
+        generate_answer.assert_called_once()
+
+
+class AssistantAgentEndToEndTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='agent-user',
+            password='FrostedPine!4729',
+        )
+        token, _ = issue_user_session(self.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token}')
+
+    @patch('api.agent.generate_answer', return_value='Boston is sunny and 18 C.')
+    @patch(
+        'api.agent.fetch_current_weather',
+        return_value='Current weather for Boston: clear sky; 18 C.',
+    )
+    def test_weather_agent_routes_invokes_tool_and_uses_session_context(
+        self,
+        fetch_weather,
+        generate_answer,
+    ):
+        response = self.client.post(
+            '/api/assistant-chat',
+            {
+                'history': [
+                    {'role': 'user', 'content': 'What is the weather in Boston?'},
+                    {'role': 'assistant', 'content': 'I can check the weather.'},
+                ],
+                'prompt': 'What about tomorrow?',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['route'], 'weather')
+        self.assertEqual(response.data['answer'], 'Boston is sunny and 18 C.')
+        self.assertEqual(response.data['sources'], [])
+        fetch_weather.assert_called_once()
+        self.assertIn('Boston', fetch_weather.call_args.args[0])
+        self.assertIn(
+            'What is the weather in Boston?',
+            generate_answer.call_args.args[1],
+        )
+        self.assertTrue(
+            QueryLog.objects.filter(
+                user=self.user,
+                query_text='What about tomorrow?',
+                result_summary='Boston is sunny and 18 C.',
+            ).exists()
+        )
+
+
+class WeatherToolTests(APITestCase):
+    @patch('api.weather._get_json')
+    def test_weather_tool_fetches_tomorrow_forecast_from_open_meteo(self, get_json):
+        get_json.side_effect = [
+            {
+                'results': [
+                    {
+                        'name': 'Boston',
+                        'admin1': 'Massachusetts',
+                        'country': 'United States',
+                        'latitude': 42.36,
+                        'longitude': -71.06,
+                    }
+                ]
+            },
+            {
+                'current': {},
+                'current_units': {},
+                'daily': {
+                    'time': ['2026-11-05', '2026-11-06'],
+                    'weather_code': [0, 63],
+                    'temperature_2m_max': [12, 10],
+                    'temperature_2m_min': [5, 3],
+                    'precipitation_probability_max': [0, 80],
+                },
+                'daily_units': {
+                    'temperature_2m_max': '°C',
+                    'temperature_2m_min': '°C',
+                },
+            },
+        ]
+
+        result = fetch_current_weather('What is the weather in Boston tomorrow?')
+
+        self.assertIn('Tomorrow forecast for Boston, Massachusetts, United States', result)
+        self.assertIn('moderate rain', result)
+        self.assertIn('high 10 °C', result)
+        self.assertIn('80%', result)
+        self.assertEqual(get_json.call_count, 2)
 
 
 class ClaudeIntegrationTests(APITestCase):
